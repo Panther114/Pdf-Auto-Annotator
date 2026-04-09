@@ -134,7 +134,7 @@ def build_prompt(text: str, config: dict) -> str:
     if num_comments >= 2:
         json_template["comment_bottom"] = "another short choppy note"
 
-    return f"""You are an experienced reader annotating a page from {context}.
+    base = f"""You are an experienced reader annotating a page from {context}.
 
 Task 1 — Highlights:
 Extract {num_highlights['min']} to {num_highlights['max']} important sentences from the text below.
@@ -149,13 +149,20 @@ Task 2 — Comments:
 Write {num_comments} short, academic, note-style comment(s) about this page.
 - Maximum 10–15 words each; incomplete sentences are fine.
 - Make each comment specific to this page's events, dialogue, or ideas.
+"""
 
+    extra_instructions = config.get("_custom_prompt", "").strip()
+    if extra_instructions:
+        base += f"\nAdditional instructions from the user:\n{extra_instructions}\n"
+
+    base += f"""
 Respond ONLY with a valid JSON object in exactly this format:
 {json.dumps(json_template, indent=4)}
 
 Page Text:
 {text}
 """
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +214,25 @@ def annotate_page(page: fitz.Page, data: dict, config: dict) -> None:
             annot.update()
 
 
-def annotate_pdf(input_pdf: str, output_pdf: str, config: dict) -> None:
+def annotate_pdf(input_pdf: str, output_pdf: str, config: dict,
+                 *, progress_cb=None, log_cb=None) -> None:
+    """Annotate *input_pdf* and write to *output_pdf*.
+
+    Optional keyword arguments
+    --------------------------
+    progress_cb : callable(current: int, total: int) | None
+        Called after each page attempt with the 1-based page number and
+        total page count so callers can drive a progress bar.
+    log_cb : callable(level: str, message: str) | None
+        Called alongside the standard logger for every info/warning/error
+        message.  *level* is one of ``"INFO"``, ``"WARNING"``, ``"ERROR"``.
+    """
+
+    def _log(level: str, msg: str) -> None:
+        getattr(logger, level.lower(), logger.info)(msg)
+        if log_cb:
+            log_cb(level.upper(), msg)
+
     client = InferenceClient(api_key=config["api_key"])
     doc = fitz.open(input_pdf)
     total = len(doc)
@@ -215,12 +240,14 @@ def annotate_pdf(input_pdf: str, output_pdf: str, config: dict) -> None:
     page_range = config.get("_page_range", range(total))
 
     for page_num in page_range:
-        logger.info(f"Page {page_num + 1}/{total} …")
+        if progress_cb:
+            progress_cb(page_num + 1, total)
+        _log("INFO", f"Page {page_num + 1}/{total} …")
         page = doc[page_num]
         text = page.get_text()
 
         if len(text.strip()) < config["min_text_length"]:
-            logger.info("  Skipping — not enough text.")
+            _log("INFO", "  Skipping — not enough text.")
             continue
 
         prompt = build_prompt(text, config)
@@ -236,25 +263,29 @@ def annotate_pdf(input_pdf: str, output_pdf: str, config: dict) -> None:
                 raw_text = response.choices[0].message.content
                 data = extract_and_parse_json(raw_text)
                 annotate_page(page, data, config)
-                logger.info(f"  ✅ Annotated successfully.")
+                _log("INFO", "  ✅ Annotated successfully.")
                 time.sleep(config["sleep_between_pages"])
                 success = True
                 break
 
             except Exception as exc:
-                logger.warning(
-                    f"  ⚠️  Attempt {attempt + 1}/{config['max_retries']} failed: {exc}"
+                _log(
+                    "WARNING",
+                    f"  ⚠️  Attempt {attempt + 1}/{config['max_retries']} failed: {exc}",
                 )
                 time.sleep(2)
 
         if not success:
-            logger.error(
+            _log(
+                "ERROR",
                 f"  ❌ All {config['max_retries']} attempts failed for page "
-                f"{page_num + 1}. Skipping."
+                f"{page_num + 1}. Skipping.",
             )
 
     doc.save(output_pdf)
-    logger.info(f"\nDone! Saved annotated PDF as: {output_pdf}")
+    if progress_cb:
+        progress_cb(total, total)
+    _log("INFO", f"Done! Saved annotated PDF as: {output_pdf}")
 
 
 # ---------------------------------------------------------------------------

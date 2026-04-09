@@ -22,13 +22,28 @@ The annotated PDF is saved as a new file — the original is never modified.
 ```bash
 # Install dependencies
 pip install pymupdf huggingface_hub
+```
 
+### GUI (recommended)
+
+```bash
+python gui.py
+```
+
+1. Click **Browse...** next to *Input PDF* and select your file — the output path is filled in automatically.
+2. Adjust the *Document context*, *Custom instructions*, API key, and model as needed.
+3. Click **Start Annotation**.
+4. Watch the progress bar and live log update in real time. When finished, a confirmation dialog appears and the session log is automatically saved next to the output PDF as `annotation_log_YYYYMMDD_HHMMSS.txt`.
+
+### Command line
+
+```bash
 # Annotate with defaults (generic literary novel categories)
 python annotator.py mybook.pdf mybook_annotated.pdf
 
 # Use your own config (recommended)
 cp config.example.json config.json
-# edit config.json to match your book and categories…
+# edit config.json to match your book and categories...
 python annotator.py mybook.pdf mybook_annotated.pdf --config config.json
 ```
 
@@ -101,7 +116,8 @@ Any model available through the HuggingFace Inference API works. Recommended fre
 ## Project structure
 
 ```
-annotator.py          Main script (CLI entry-point)
+gui.py                GUI entry-point (tkinter)
+annotator.py          Core logic + CLI entry-point
 config.example.json   Annotated example configuration
 annotator v0.3.py     Original prototype (kept for reference)
 ```
@@ -115,7 +131,6 @@ Ideas for improving the tool further:
 - **Multi-PDF batch mode** — annotate an entire folder in one command
 - **Additional annotation types** — margin notes, strikethrough, underline, bookmarks
 - **OpenAI / Anthropic / Ollama backend** — swap the LLM provider via config
-- **GUI / web interface** — drag-and-drop PDF with live preview
 - **Fine-tuned annotation models** — small, fast models trained specifically for annotation tasks
 - **Annotation templates** — shareable JSON presets for common curricula (AP Lit, IB, etc.)
 - **Export to CSV/JSON** — extract all highlights and comments as structured data
