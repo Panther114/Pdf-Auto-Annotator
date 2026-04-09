@@ -6,16 +6,39 @@ Run with:
 
 Requirements: same as annotator.py (pymupdf, huggingface_hub).
 tkinter is part of the Python standard library.
+
+Two-phase flow
+--------------
+1. Fill in the fields and click "Discover Categories".
+   The app samples your PDF with the LLM and shows you what it found.
+2. Review the colour-coded category list, then click "Confirm & Annotate"
+   to annotate every page using those categories.
 """
 
+import json
+import os
 import queue
+import subprocess
+import sys
 import threading
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+import time
 from datetime import datetime
 from pathlib import Path
 
-from annotator import DEFAULT_CONFIG, annotate_pdf, load_config
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+
+from annotator import (
+    DEFAULT_CONFIG,
+    annotate_pdf,
+    compute_output_path,
+    discover_categories,
+    load_config,
+    validate_config,
+)
+
+import fitz
+from huggingface_hub import InferenceClient
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,8 +57,23 @@ LOG_TAG_COLORS = {
     "INFO":    "#1a1a1a",
 }
 
-WINDOW_MIN_WIDTH  = 660
-WINDOW_MIN_HEIGHT = 640
+# Swatch colours shown next to each discovered category in the preview panel.
+# These must be valid Tk colour strings and should visually match the RGB
+# values in DEFAULT_CONFIG["annotation_colors"].
+SWATCH_TK_COLORS = ["#ffff00", "#99ff99", "#99ccff", "#ffcc99", "#ff99cc", "#ccccff"]
+
+WINDOW_MIN_WIDTH  = 720
+WINDOW_MIN_HEIGHT = 700
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+def _rgb_to_tk(rgb):
+    """Convert a [R, G, B] list (0-1 floats) to a '#rrggbb' Tk colour string."""
+    r, g, b = (int(v * 255) for v in rgb)
+    return "#{:02x}{:02x}{:02x}".format(r, g, b)
 
 
 # ---------------------------------------------------------------------------
@@ -43,15 +81,19 @@ WINDOW_MIN_HEIGHT = 640
 # ---------------------------------------------------------------------------
 
 class AnnotatorApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
         self.title("PDF Auto-Annotator")
         self.minsize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
         self.resizable(True, True)
 
-        self._msg_queue: queue.Queue = queue.Queue()
-        self._worker_thread: threading.Thread | None = None
-        self._log_lines: list[str] = []
+        self._msg_queue = queue.Queue()
+        self._worker_thread = None
+        self._cancel_event = threading.Event()
+        self._log_lines = []          # plain-text lines
+        self._log_records = []        # structured dicts for JSON log
+        self._discovered_categories = None
+        self._output_path = None      # computed after input selected
 
         self._build_ui()
         self._poll_queue()
@@ -60,7 +102,7 @@ class AnnotatorApp(tk.Tk):
     # UI construction
     # ------------------------------------------------------------------
 
-    def _build_ui(self) -> None:
+    def _build_ui(self):
         outer_pad = {"padx": 10, "pady": 4}
 
         # -- Files -------------------------------------------------------
@@ -68,77 +110,165 @@ class AnnotatorApp(tk.Tk):
         file_frame.pack(fill="x", **outer_pad)
         file_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(file_frame, text="Input PDF:").grid(
-            row=0, column=0, sticky="w", pady=2)
+        ttk.Label(file_frame, text="Input PDF:").grid(row=0, column=0, sticky="w", pady=2)
         self._input_var = tk.StringVar()
+        self._input_var.trace_add("write", self._on_input_changed)
         ttk.Entry(file_frame, textvariable=self._input_var).grid(
             row=0, column=1, sticky="ew", padx=6)
         ttk.Button(file_frame, text="Browse...",
                    command=self._browse_input).grid(row=0, column=2)
 
-        ttk.Label(file_frame, text="Output PDF:").grid(
-            row=1, column=0, sticky="w", pady=2)
-        self._output_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self._output_var).grid(
-            row=1, column=1, sticky="ew", padx=6)
-        ttk.Button(file_frame, text="Browse...",
-                   command=self._browse_output).grid(row=1, column=2)
+        # Output path label (read-only, auto-computed)
+        ttk.Label(file_frame, text="Output PDF:").grid(row=1, column=0, sticky="w", pady=2)
+        self._output_label_var = tk.StringVar(value="(auto - chosen after input selected)")
+        ttk.Label(
+            file_frame, textvariable=self._output_label_var,
+            foreground="grey", anchor="w",
+        ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=6)
+
+        # PDF thumbnail
+        self._thumb_label = ttk.Label(file_frame, text="No PDF loaded", foreground="grey")
+        self._thumb_label.grid(row=2, column=0, columnspan=3, pady=(4, 0))
 
         # -- Settings ----------------------------------------------------
         settings_frame = ttk.LabelFrame(self, text="Settings", padding=8)
         settings_frame.pack(fill="x", **outer_pad)
         settings_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(settings_frame, text="Document context:").grid(
-            row=0, column=0, sticky="w", pady=2)
-        self._context_var = tk.StringVar(value=DEFAULT_CONFIG["context"])
-        ttk.Entry(settings_frame, textvariable=self._context_var).grid(
-            row=0, column=1, columnspan=2, sticky="ew", padx=6)
+        row = 0
 
-        ttk.Label(settings_frame, text="Custom instructions\n(optional):").grid(
-            row=1, column=0, sticky="nw", pady=2)
+        ttk.Label(settings_frame, text="Annotation goal:").grid(
+            row=row, column=0, sticky="w", pady=2)
+        self._goal_var = tk.StringVar(value=DEFAULT_CONFIG.get("annotation_goal", ""))
+        goal_entry = ttk.Entry(settings_frame, textvariable=self._goal_var)
+        goal_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        ttk.Label(
+            settings_frame,
+            text='e.g. "study for a law school exam"',
+            foreground="grey",
+        ).grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=6)
+        row += 2
+
+        ttk.Label(settings_frame, text="Document type:").grid(
+            row=row, column=0, sticky="w", pady=2)
+        self._doctype_var = tk.StringVar(value=DEFAULT_CONFIG.get("document_type", ""))
+        ttk.Entry(settings_frame, textvariable=self._doctype_var).grid(
+            row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        ttk.Label(
+            settings_frame,
+            text='e.g. "scientific paper", "legal brief", "novel"',
+            foreground="grey",
+        ).grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=6)
+        row += 2
+
+        # Page range
+        ttk.Label(settings_frame, text="Page range:").grid(
+            row=row, column=0, sticky="w", pady=2)
+        page_range_frame = ttk.Frame(settings_frame)
+        page_range_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
+        ttk.Label(page_range_frame, text="From page").pack(side="left")
+        self._page_from = tk.IntVar(value=1)
+        ttk.Spinbox(
+            page_range_frame, from_=1, to=9999, width=6,
+            textvariable=self._page_from,
+        ).pack(side="left", padx=(4, 8))
+        ttk.Label(page_range_frame, text="to").pack(side="left")
+        self._page_to = tk.IntVar(value=0)
+        ttk.Spinbox(
+            page_range_frame, from_=0, to=9999, width=6,
+            textvariable=self._page_to,
+        ).pack(side="left", padx=(4, 0))
+        ttk.Label(page_range_frame, text="  (0 = all pages)", foreground="grey").pack(side="left")
+        row += 1
+
+        ttk.Label(settings_frame, text="Custom notes\n(optional):").grid(
+            row=row, column=0, sticky="nw", pady=2)
         self._prompt_text = tk.Text(settings_frame, height=3, wrap="word")
-        self._prompt_text.grid(
-            row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=2)
+        self._prompt_text.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=2)
         ttk.Label(
             settings_frame,
             text="Extra guidance appended to the auto-generated prompt.",
             foreground="grey",
-        ).grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+        ).grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=6)
+        row += 2
 
         ttk.Label(settings_frame, text="API Key:").grid(
-            row=3, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=2)
         self._apikey_var = tk.StringVar(value=DEFAULT_CONFIG["api_key"])
         ttk.Entry(settings_frame, textvariable=self._apikey_var, show="*").grid(
-            row=3, column=1, columnspan=2, sticky="ew", padx=6)
+            row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        row += 1
 
         ttk.Label(settings_frame, text="Model:").grid(
-            row=4, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=2)
         self._model_var = tk.StringVar(value=DEFAULT_CONFIG["model"])
         ttk.Combobox(
             settings_frame, textvariable=self._model_var, values=PRESET_MODELS,
-        ).grid(row=4, column=1, columnspan=2, sticky="ew", padx=6)
+        ).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        row += 1
 
         ttk.Label(settings_frame, text="Config file:").grid(
-            row=5, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=2)
         self._config_var = tk.StringVar()
         ttk.Entry(settings_frame, textvariable=self._config_var).grid(
-            row=5, column=1, sticky="ew", padx=6)
+            row=row, column=1, sticky="ew", padx=6)
         ttk.Button(settings_frame, text="Browse...",
-                   command=self._browse_config).grid(row=5, column=2)
+                   command=self._browse_config).grid(row=row, column=2)
 
-        # -- Run button --------------------------------------------------
-        self._run_btn = ttk.Button(
-            self, text="Start Annotation", command=self._start)
-        self._run_btn.pack(pady=(8, 2))
+        # -- Phase 1 button ----------------------------------------------
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=(10, 2))
+
+        self._discover_btn = ttk.Button(
+            btn_frame, text="Step 1: Discover Categories",
+            command=self._start_discovery,
+        )
+        self._discover_btn.grid(row=0, column=0, padx=6)
+
+        self._cancel_btn = ttk.Button(
+            btn_frame, text="Cancel",
+            command=self._cancel, state="disabled",
+        )
+        self._cancel_btn.grid(row=0, column=1, padx=6)
+
+        # -- Category preview panel --------------------------------------
+        cat_frame = ttk.LabelFrame(self, text="Discovered Categories (Phase 1 result)", padding=8)
+        cat_frame.pack(fill="x", **outer_pad)
+        self._cat_inner = ttk.Frame(cat_frame)
+        self._cat_inner.pack(fill="x")
+        self._cat_placeholder = ttk.Label(
+            self._cat_inner,
+            text="Run Step 1 to discover annotation categories for your document.",
+            foreground="grey",
+        )
+        self._cat_placeholder.pack(anchor="w")
+
+        rerun_frame = ttk.Frame(cat_frame)
+        rerun_frame.pack(fill="x", pady=(4, 0))
+        self._rerun_btn = ttk.Button(
+            rerun_frame, text="Re-run Discovery",
+            command=self._start_discovery, state="disabled",
+        )
+        self._rerun_btn.pack(side="left")
+
+        # -- Phase 2 button ----------------------------------------------
+        self._annotate_btn = ttk.Button(
+            self, text="Step 2: Confirm & Annotate",
+            command=self._start_annotation, state="disabled",
+        )
+        self._annotate_btn.pack(pady=(4, 2))
 
         # -- Progress ----------------------------------------------------
         progress_frame = ttk.LabelFrame(self, text="Progress", padding=8)
         progress_frame.pack(fill="x", **outer_pad)
         progress_frame.columnconfigure(0, weight=1)
 
-        self._progress_label = ttk.Label(progress_frame, text="Idle")
-        self._progress_label.grid(row=0, column=0, sticky="w")
+        eta_row = ttk.Frame(progress_frame)
+        eta_row.grid(row=0, column=0, sticky="ew")
+        self._progress_label = ttk.Label(eta_row, text="Idle")
+        self._progress_label.pack(side="left")
+        self._eta_label = ttk.Label(eta_row, text="", foreground="grey")
+        self._eta_label.pack(side="right")
 
         self._progress_bar = ttk.Progressbar(
             progress_frame, mode="determinate", maximum=100)
@@ -160,31 +290,24 @@ class AnnotatorApp(tk.Tk):
         for tag, color in LOG_TAG_COLORS.items():
             self._log_box.tag_config(tag, foreground=color)
 
+        # Internal timing state for ETA
+        self._annotation_start = None
+        self._last_page_num = 0
+        self._total_pages = 0
+
     # ------------------------------------------------------------------
     # Browse helpers
     # ------------------------------------------------------------------
 
-    def _browse_input(self) -> None:
+    def _browse_input(self):
         path = filedialog.askopenfilename(
             title="Select input PDF",
             filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
         )
         if path:
             self._input_var.set(path)
-            if not self._output_var.get():
-                p = Path(path)
-                self._output_var.set(str(p.with_stem(p.stem + "_annotated")))
 
-    def _browse_output(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Save annotated PDF as",
-            defaultextension=".pdf",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-        )
-        if path:
-            self._output_var.set(path)
-
-    def _browse_config(self) -> None:
+    def _browse_config(self):
         path = filedialog.askopenfilename(
             title="Select config file",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
@@ -193,25 +316,61 @@ class AnnotatorApp(tk.Tk):
             self._config_var.set(path)
 
     # ------------------------------------------------------------------
-    # Start annotation
+    # Input-change hook
     # ------------------------------------------------------------------
 
-    def _start(self) -> None:
-        input_pdf  = self._input_var.get().strip()
-        output_pdf = self._output_var.get().strip()
-
-        if not input_pdf:
-            messagebox.showerror("Missing input", "Please select an input PDF.")
-            return
-        if not output_pdf:
-            messagebox.showerror("Missing output",
-                                 "Please specify an output PDF path.")
-            return
-        if not Path(input_pdf).exists():
-            messagebox.showerror("File not found",
-                                 f"Input file not found:\n{input_pdf}")
+    def _on_input_changed(self, *_):
+        input_pdf = self._input_var.get().strip()
+        if not input_pdf or not Path(input_pdf).exists():
+            self._output_label_var.set("(auto - chosen after input selected)")
+            self._thumb_label.config(text="No PDF loaded", image="", foreground="grey")
+            self._output_path = None
             return
 
+        # Compute output path
+        out = compute_output_path(input_pdf)
+        self._output_path = str(out)
+        self._output_label_var.set(self._output_path)
+
+        # PDF thumbnail (first page)
+        self._load_thumbnail(input_pdf)
+
+        # Set page_to spinbox max to number of pages
+        try:
+            doc = fitz.open(input_pdf)
+            n = len(doc)
+            doc.close()
+            self._page_to.set(n)
+        except Exception:
+            pass
+
+    def _load_thumbnail(self, pdf_path):
+        """Render the first page of the PDF as a small preview label."""
+        try:
+            doc = fitz.open(pdf_path)
+            page = doc[0]
+            # Render at low resolution (fits in ~180 px wide)
+            mat = fitz.Matrix(0.25, 0.25)
+            pix = page.get_pixmap(matrix=mat)
+            doc.close()
+            # Encode as PPM and feed to Tk PhotoImage
+            img_data = pix.tobytes("ppm")
+            photo = tk.PhotoImage(data=img_data)
+            self._thumb_photo = photo  # keep reference
+            self._thumb_label.config(
+                image=photo, text="", compound="center",
+            )
+        except Exception as exc:
+            self._thumb_label.config(
+                text="Preview unavailable: {}".format(exc),
+                image="", foreground="grey",
+            )
+
+    # ------------------------------------------------------------------
+    # Build config from UI
+    # ------------------------------------------------------------------
+
+    def _build_config(self):
         config = load_config(self._config_var.get().strip() or None)
 
         api_key = self._apikey_var.get().strip()
@@ -220,54 +379,165 @@ class AnnotatorApp(tk.Tk):
         model = self._model_var.get().strip()
         if model:
             config["model"] = model
-        context = self._context_var.get().strip()
-        if context:
-            config["context"] = context
+        goal = self._goal_var.get().strip()
+        if goal:
+            config["annotation_goal"] = goal
+        doc_type = self._doctype_var.get().strip()
+        if doc_type:
+            config["document_type"] = doc_type
         custom_prompt = self._prompt_text.get("1.0", "end-1c").strip()
         if custom_prompt:
             config["_custom_prompt"] = custom_prompt
 
+        # Page range
+        p_from = self._page_from.get()
+        p_to = self._page_to.get()
+        if p_to > 0 and (p_from > 1 or p_to < 99999):
+            try:
+                doc = fitz.open(self._input_var.get().strip())
+                total = len(doc)
+                doc.close()
+                start = max(0, p_from - 1)
+                end = min(p_to, total)
+                config["_page_range"] = range(start, end)
+            except Exception:
+                pass
+
+        return config
+
+    # ------------------------------------------------------------------
+    # Phase 1 - Category discovery
+    # ------------------------------------------------------------------
+
+    def _start_discovery(self):
+        input_pdf = self._input_var.get().strip()
+        if not input_pdf:
+            messagebox.showerror("Missing input", "Please select an input PDF first.")
+            return
+        if not Path(input_pdf).exists():
+            messagebox.showerror("File not found",
+                                 "Input file not found:\n{}".format(input_pdf))
+            return
+
+        config = self._build_config()
+        try:
+            validate_config(config)
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return
+
         self._clear_log()
+        self._discovered_categories = None
+        self._annotate_btn.config(state="disabled")
+        self._discover_btn.config(state="disabled")
+        self._rerun_btn.config(state="disabled")
+        self._cancel_event.clear()
+        self._cancel_btn.config(state="normal")
+        self._progress_label.config(text="Discovering categories...")
         self._progress_bar["value"] = 0
-        self._progress_label.config(text="Starting...")
-        self._run_btn.config(state="disabled")
 
         self._worker_thread = threading.Thread(
-            target=self._run_worker,
-            args=(input_pdf, output_pdf, config),
+            target=self._discovery_worker,
+            args=(input_pdf, config),
             daemon=True,
         )
         self._worker_thread.start()
 
-    def _run_worker(self, input_pdf: str, output_pdf: str, config: dict) -> None:
-        """Runs in the background thread; communicates via _msg_queue."""
+    def _discovery_worker(self, input_pdf, config):
         try:
-            annotate_pdf(
-                input_pdf,
-                output_pdf,
-                config,
-                progress_cb=self._on_progress,
-                log_cb=self._on_log,
-            )
-            self._msg_queue.put(("DONE", output_pdf))
+            client = InferenceClient(api_key=config["api_key"])
+            doc = fitz.open(input_pdf)
+            cats = discover_categories(doc, config, client, log_cb=self._on_log)
+            doc.close()
+            self._msg_queue.put(("CATEGORIES", cats))
         except Exception as exc:
             self._msg_queue.put(("FATAL", str(exc)))
 
     # ------------------------------------------------------------------
-    # Callbacks from the annotation thread (thread-safe via queue)
+    # Phase 2 - Annotation
     # ------------------------------------------------------------------
 
-    def _on_progress(self, current: int, total: int) -> None:
+    def _start_annotation(self):
+        if not self._discovered_categories:
+            messagebox.showerror("No categories", "Please run Step 1 first.")
+            return
+
+        input_pdf = self._input_var.get().strip()
+        if not input_pdf or not Path(input_pdf).exists():
+            messagebox.showerror("File not found",
+                                 "Input file not found:\n{}".format(input_pdf))
+            return
+
+        output_pdf = self._output_path
+        if not output_pdf:
+            output_pdf = str(compute_output_path(input_pdf))
+            self._output_path = output_pdf
+
+        config = self._build_config()
+        try:
+            validate_config(config)
+        except ValueError as exc:
+            messagebox.showerror("Invalid settings", str(exc))
+            return
+
+        self._clear_log()
+        self._progress_bar["value"] = 0
+        self._progress_label.config(text="Starting annotation...")
+        self._eta_label.config(text="")
+        self._annotate_btn.config(state="disabled")
+        self._discover_btn.config(state="disabled")
+        self._rerun_btn.config(state="disabled")
+        self._cancel_event.clear()
+        self._cancel_btn.config(state="normal")
+        self._annotation_start = time.monotonic()
+        self._last_page_num = 0
+
+        self._worker_thread = threading.Thread(
+            target=self._annotation_worker,
+            args=(input_pdf, output_pdf, config, self._discovered_categories),
+            daemon=True,
+        )
+        self._worker_thread.start()
+
+    def _annotation_worker(self, input_pdf, output_pdf, config, categories):
+        try:
+            results = annotate_pdf(
+                input_pdf,
+                output_pdf,
+                config,
+                categories=categories,
+                progress_cb=self._on_progress,
+                log_cb=self._on_log,
+                cancel_event=self._cancel_event,
+            )
+            self._msg_queue.put(("DONE", output_pdf, results))
+        except Exception as exc:
+            self._msg_queue.put(("FATAL", str(exc)))
+
+    # ------------------------------------------------------------------
+    # Cancel
+    # ------------------------------------------------------------------
+
+    def _cancel(self):
+        self._cancel_event.set()
+        self._cancel_btn.config(state="disabled")
+        self._progress_label.config(text="Cancelling...")
+
+    # ------------------------------------------------------------------
+    # Callbacks from worker threads (thread-safe via queue)
+    # ------------------------------------------------------------------
+
+    def _on_progress(self, current, total):
         self._msg_queue.put(("PROGRESS", current, total))
 
-    def _on_log(self, level: str, message: str) -> None:
+    def _on_log(self, level, message):
         self._msg_queue.put(("LOG", level, message))
 
     # ------------------------------------------------------------------
-    # Queue polling (runs on main thread via after())
+    # Queue polling
     # ------------------------------------------------------------------
 
-    def _poll_queue(self) -> None:
+    def _poll_queue(self):
         try:
             while True:
                 item = self._msg_queue.get_nowait()
@@ -275,35 +545,61 @@ class AnnotatorApp(tk.Tk):
 
                 if kind == "PROGRESS":
                     _, current, total = item
+                    self._last_page_num = current
+                    self._total_pages = total
                     pct = int((current / total) * 100) if total else 0
                     self._progress_bar["value"] = pct
                     self._progress_label.config(
-                        text=f"Page {current} of {total}  ({pct}%)")
+                        text="Page {} of {}  ({}%)".format(current, total, pct))
+
+                    # ETA
+                    if self._annotation_start and current > 1:
+                        elapsed = time.monotonic() - self._annotation_start
+                        rate = elapsed / current
+                        remaining = rate * (total - current)
+                        self._eta_label.config(
+                            text="ETA: ~{}s remaining".format(int(remaining)))
 
                 elif kind == "LOG":
                     _, level, message = item
                     self._append_log(level, message)
 
+                elif kind == "CATEGORIES":
+                    _, cats = item
+                    self._discovered_categories = cats
+                    self._show_categories(cats)
+                    self._annotate_btn.config(state="normal")
+                    self._discover_btn.config(state="normal")
+                    self._rerun_btn.config(state="normal")
+                    self._cancel_btn.config(state="disabled")
+                    self._progress_label.config(text="Categories ready - click Step 2 to annotate")
+
                 elif kind == "DONE":
-                    _, out_path = item
+                    _, out_path, results = item
                     self._progress_bar["value"] = 100
                     self._progress_label.config(text="Done")
+                    self._eta_label.config(text="")
                     self._append_log("SUCCESS",
-                                     f"Saved annotated PDF -> {out_path}")
-                    self._save_log(out_path)
-                    self._run_btn.config(state="normal")
-                    messagebox.showinfo(
-                        "Done",
-                        f"Annotation complete!\n\nSaved to:\n{out_path}",
-                    )
+                                     "Saved annotated PDF -> {}".format(out_path))
+                    self._save_log(out_path, results)
+                    self._discover_btn.config(state="normal")
+                    self._rerun_btn.config(state="normal")
+                    self._annotate_btn.config(state="normal")
+                    self._cancel_btn.config(state="disabled")
+
+                    # Completion dialog with "Open file" button
+                    self._show_done_dialog(out_path)
 
                 elif kind == "FATAL":
                     _, msg = item
-                    self._append_log("ERROR", f"Fatal error: {msg}")
+                    self._append_log("ERROR", "Fatal error: {}".format(msg))
                     self._progress_label.config(text="Failed")
-                    self._run_btn.config(state="normal")
+                    self._discover_btn.config(state="normal")
+                    self._rerun_btn.config(state="normal")
+                    self._annotate_btn.config(state="normal")
+                    self._cancel_btn.config(state="disabled")
                     messagebox.showerror("Error",
-                                         f"Annotation failed:\n\n{msg}")
+                                         "Operation failed:\n\n{}".format(msg))
 
         except queue.Empty:
             pass
@@ -311,13 +607,77 @@ class AnnotatorApp(tk.Tk):
         self.after(100, self._poll_queue)
 
     # ------------------------------------------------------------------
+    # Category preview panel
+    # ------------------------------------------------------------------
+
+    def _show_categories(self, categories):
+        # Clear old widgets
+        for w in self._cat_inner.winfo_children():
+            w.destroy()
+
+        colors = DEFAULT_CONFIG["annotation_colors"]
+        for idx, cat in enumerate(categories):
+            row_frame = ttk.Frame(self._cat_inner)
+            row_frame.pack(fill="x", pady=2)
+
+            # Colour swatch
+            tk_color = _rgb_to_tk(colors[idx % len(colors)])
+            swatch = tk.Label(
+                row_frame, text="   ", bg=tk_color,
+                relief="solid", borderwidth=1,
+            )
+            swatch.pack(side="left", padx=(0, 8))
+
+            label_text = "{}  -  {}".format(cat["key"], cat["label"])
+            ttk.Label(row_frame, text=label_text, anchor="w").pack(side="left", fill="x")
+
+    # ------------------------------------------------------------------
+    # Completion dialog
+    # ------------------------------------------------------------------
+
+    def _show_done_dialog(self, out_path):
+        dialog = tk.Toplevel(self)
+        dialog.title("Annotation Complete")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Annotation complete!", font=("", 12, "bold")).pack(
+            pady=(16, 4), padx=20)
+        ttk.Label(dialog, text="Saved to:", foreground="grey").pack()
+        ttk.Label(dialog, text=out_path, wraplength=400).pack(padx=20, pady=(0, 12))
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(pady=(0, 16))
+
+        def open_file():
+            try:
+                if sys.platform == "win32":
+                    os.startfile(out_path)
+                elif sys.platform == "darwin":
+                    subprocess.call(["open", out_path])
+                else:
+                    subprocess.call(["xdg-open", out_path])
+            except Exception as exc:
+                messagebox.showwarning("Could not open file", str(exc))
+
+        ttk.Button(btn_row, text="Open Annotated PDF", command=open_file).grid(
+            row=0, column=0, padx=6)
+        ttk.Button(btn_row, text="Close", command=dialog.destroy).grid(
+            row=0, column=1, padx=6)
+
+    # ------------------------------------------------------------------
     # Log helpers
     # ------------------------------------------------------------------
 
-    def _append_log(self, level: str, message: str) -> None:
+    def _append_log(self, level, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        line = f"{timestamp} [{level}] {message}\n"
+        line = "{} [{}] {}\n".format(timestamp, level, message)
         self._log_lines.append(line)
+        self._log_records.append({
+            "time": timestamp,
+            "level": level,
+            "message": message,
+        })
 
         self._log_box.config(state="normal")
         tag = level if level in LOG_TAG_COLORS else "INFO"
@@ -325,28 +685,47 @@ class AnnotatorApp(tk.Tk):
         self._log_box.see("end")
         self._log_box.config(state="disabled")
 
-    def _clear_log(self) -> None:
+    def _clear_log(self):
         self._log_lines = []
+        self._log_records = []
         self._log_box.config(state="normal")
         self._log_box.delete("1.0", "end")
         self._log_box.config(state="disabled")
 
-    def _save_log(self, output_pdf: str) -> None:
+    def _save_log(self, output_pdf, page_results=None):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = Path(output_pdf).with_name(
-            f"annotation_log_{timestamp}.txt")
+        base = Path(output_pdf).with_name("annotation_log_{}".format(timestamp))
+
+        # Plain-text log
+        txt_path = base.with_suffix(".txt")
         try:
-            log_path.write_text("".join(self._log_lines), encoding="utf-8")
-            self._append_log("INFO", f"Log saved -> {log_path}")
+            txt_path.write_text("".join(self._log_lines), encoding="utf-8")
+            self._append_log("INFO", "Text log saved -> {}".format(txt_path))
         except Exception as exc:
-            self._append_log("WARNING", f"Could not save log: {exc}")
+            self._append_log("WARNING", "Could not save text log: {}".format(exc))
+
+        # Structured JSON log
+        json_path = base.with_suffix(".json")
+        try:
+            payload = {
+                "session_timestamp": timestamp,
+                "output_pdf": output_pdf,
+                "log_entries": self._log_records,
+                "page_results": page_results or [],
+            }
+            json_path.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            self._append_log("INFO", "JSON log saved  -> {}".format(json_path))
+        except Exception as exc:
+            self._append_log("WARNING", "Could not save JSON log: {}".format(exc))
 
 
 # ---------------------------------------------------------------------------
 # Entry-point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main():
     app = AnnotatorApp()
     app.mainloop()
 

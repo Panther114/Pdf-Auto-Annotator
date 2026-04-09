@@ -1,26 +1,25 @@
 {
-  "_comment": "Copy this file to config.json and customize for your project.",
-  "api_key": "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",
+  "_comment": "Copy this file to config.json and edit as needed. All fields are optional — any you omit will use the built-in default.",
+
+  "api_key": "hf_YOUR_KEY_HERE",
   "model": "meta-llama/Meta-Llama-3-8B-Instruct",
-  "max_tokens": 800,
+
+  "annotation_goal": "study for a law school exam",
+  "document_type": "legal brief",
+
+  "annotation_colors": [
+    [1,   1,   0  ],
+    [0.6, 1,   0.6],
+    [0.6, 0.8, 1  ]
+  ],
+
+  "num_comments": 2,
+  "num_highlights": { "min": 5, "max": 7 },
+
+  "append_legend": true,
+
+  "max_tokens": 1000,
   "max_retries": 3,
   "sleep_between_pages": 3,
-  "min_text_length": 200,
-  "context": "The Catcher in the Rye by J.D. Salinger",
-  "categories": {
-    "bildungsroman_quotes": {
-      "color": [1, 1, 0],
-      "label": "Coming-of-age / Bildungsroman"
-    },
-    "expectations_quotes": {
-      "color": [0.6, 1, 0.6],
-      "label": "Social expectations and conformity"
-    },
-    "barriers_quotes": {
-      "color": [0.6, 0.8, 1],
-      "label": "Barriers to connection and isolation"
-    }
-  },
-  "num_highlights": { "min": 5, "max": 7 },
-  "num_comments": 2
+  "min_text_length": 200
 }
