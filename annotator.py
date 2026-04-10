@@ -64,7 +64,8 @@ DEFAULT_CONFIG: dict = {
     "max_retries": 3,
     "sleep_between_pages": 3,
     "min_text_length": 200,
-    # Number of pages sampled during Phase 1 category discovery (0 = all pages).
+    # Number of pages sampled during Phase 1 category discovery.
+    # 0 = all pages (default). Values larger than the document page count also sample all pages.
     "discovery_sample_pages": 0,
     # What you want to get out of the annotation.
     "annotation_goal": "",
@@ -89,8 +90,8 @@ DEFAULT_CONFIG: dict = {
 _MAX_COLORS = 6
 _MAX_COMMENTS = 4
 
-# Phase 1 sampling parameters (overridable via config)
-_DISCOVERY_SAMPLE_PAGES = 10
+# Phase 1 sampling parameters (overridable via config; 0 = all pages)
+_DISCOVERY_SAMPLE_PAGES = 0
 _DISCOVERY_CHARS_PER_PAGE = 5000
 
 
