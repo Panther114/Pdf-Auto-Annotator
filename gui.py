@@ -65,8 +65,17 @@ SWATCH_TK_COLORS = ["#ffff00", "#99ff99", "#99ccff", "#ffcc99", "#ff99cc", "#ccc
 WINDOW_MIN_WIDTH  = 640
 WINDOW_MIN_HEIGHT = 520
 
+# Maximum number of queue items processed in a single _poll_queue() call.
+# Capping this prevents a flood of worker-thread messages (log lines, progress
+# updates) from monopolising the Tk event loop and freezing the UI.
+_MAX_QUEUE_ITEMS_PER_CYCLE = 50
+
 # Persistent error log written next to the running script.
 LOG_FILE = Path(__file__).parent / "log.txt"
+
+# Lock that serialises daemon-thread writes to LOG_FILE so entries are never
+# interleaved.
+_log_file_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +107,7 @@ class AnnotatorApp(tk.Tk):
         self._discovered_categories = None
         self._output_path = None      # computed after input selected
         self._pdf_page_count = 0      # cached page count of the loaded PDF
+        self._input_debounce_id = None  # after() id for debounced input handler
 
         self._build_ui()
         self._poll_queue()
@@ -305,6 +315,18 @@ class AnnotatorApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_input_changed(self, *_):
+        # Debounce: wait 400 ms after the last keystroke before doing any I/O.
+        if self._input_debounce_id is not None:
+            self.after_cancel(self._input_debounce_id)
+        self._input_debounce_id = self.after(400, self._apply_input_change)
+
+    def _apply_input_change(self):
+        """Called ~400 ms after the user stops typing in the input field.
+
+        Heavy operations (directory creation, PDF open) are offloaded to a
+        background thread so the main thread stays responsive.
+        """
+        self._input_debounce_id = None
         input_pdf = self._input_var.get().strip()
         if not input_pdf or not Path(input_pdf).exists():
             self._output_label_var.set("(auto - chosen after input selected)")
@@ -312,19 +334,28 @@ class AnnotatorApp(tk.Tk):
             self._pdf_page_count = 0
             return
 
-        # Compute output path
-        out = compute_output_path(input_pdf)
-        self._output_path = str(out)
-        self._output_label_var.set(self._output_path)
+        # Derive the output path (string computation only — no mkdir yet).
+        p = Path(input_pdf)
+        out_dir = p.parent / "annotated"
+        out_path = str(out_dir / (p.stem + "_annotated.pdf"))
+        self._output_path = out_path
+        self._output_label_var.set(out_path)
 
-        # Cache page count and update page_to spinbox in a single open
-        try:
-            doc = fitz.open(input_pdf)
-            self._pdf_page_count = len(doc)
-            doc.close()
-            self._page_to.set(self._pdf_page_count)
-        except Exception:
-            self._pdf_page_count = 0
+        # Create the output directory and open the PDF in a background thread
+        # so that disk I/O does not block the Tk main loop.
+        def _load():
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                doc = fitz.open(input_pdf)
+                count = len(doc)
+                doc.close()
+            except Exception as exc:
+                self._msg_queue.put(("LOG", "WARNING",
+                                     "Could not read page count: {}".format(exc)))
+                count = 0
+            self._msg_queue.put(("PAGE_COUNT", count))
+
+        threading.Thread(target=_load, daemon=True).start()
 
     # ------------------------------------------------------------------
     # Build config from UI
@@ -493,8 +524,11 @@ class AnnotatorApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _poll_queue(self):
+        # Process at most _MAX_QUEUE_ITEMS_PER_CYCLE items per cycle so that a
+        # flood of log/progress messages from the worker thread does not starve
+        # the Tk event loop.
         try:
-            while True:
+            for _ in range(_MAX_QUEUE_ITEMS_PER_CYCLE):
                 item = self._msg_queue.get_nowait()
                 kind = item[0]
 
@@ -514,6 +548,11 @@ class AnnotatorApp(tk.Tk):
                         remaining = rate * (total - current)
                         self._eta_label.config(
                             text="ETA: ~{}s remaining".format(int(remaining)))
+
+                elif kind == "PAGE_COUNT":
+                    _, count = item
+                    self._pdf_page_count = count
+                    self._page_to.set(count)
 
                 elif kind == "LOG":
                     _, level, message = item
@@ -640,13 +679,20 @@ class AnnotatorApp(tk.Tk):
         self._log_box.see("end")
         self._log_box.config(state="disabled")
 
-        # Persist errors and warnings to the log file immediately.
+        # Persist errors and warnings to the log file off the main thread
+        # so that disk I/O does not block the UI.
         if level in ("ERROR", "WARNING"):
-            try:
-                with open(LOG_FILE, "a", encoding="utf-8") as fh:
-                    fh.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S ") + line)
-            except OSError:
-                pass
+            full_line = datetime.now().strftime("%Y-%m-%d %H:%M:%S ") + line
+
+            def _write():
+                try:
+                    with _log_file_lock:
+                        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                            fh.write(full_line)
+                except OSError:
+                    pass
+
+            threading.Thread(target=_write, daemon=True).start()
 
     def _clear_log(self):
         self._log_lines = []
