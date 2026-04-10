@@ -172,18 +172,21 @@ def validate_config(config):
 # ---------------------------------------------------------------------------
 
 def extract_and_parse_json(text):
-    """Extract the first JSON object or array from text, tolerating minor syntax errors."""
-    match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
+    match = re.search(r"(\{.*?\}|\[.*?\])", text, re.DOTALL)
     if not match:
         raise ValueError("No JSON object or array found in model response.")
-    clean = match.group(0).replace("\n", "\\n")
+    
+    raw = match.group(0)
+    
     try:
-        return json.loads(clean)
+        return json.loads(raw)
     except json.JSONDecodeError:
         pass
+    
+    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
     try:
-        return ast.literal_eval(clean)
-    except Exception as exc:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as exc:
         raise ValueError("Failed to parse model output as JSON: {}".format(exc)) from exc
 
 
