@@ -357,7 +357,7 @@ class AnnotatorApp(tk.Tk):
                     self._lang_depth_var.set(depth)
             except (TypeError, ValueError):
                 pass
-        # Custom notes / instructions stored under _custom_prompt or instructions
+        # Custom notes: try multiple key aliases in priority order, use first found.
         for key in ("_custom_prompt", "instructions", "custom_notes"):
             if key in cfg and cfg[key]:
                 self._prompt_text.delete("1.0", "end")

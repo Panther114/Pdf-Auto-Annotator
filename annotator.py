@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -91,13 +92,13 @@ DEFAULT_CONFIG: dict = {
 }
 
 # Language depth instructions injected into prompts (1 = simplest, 5 = most advanced).
-_LANGUAGE_DEPTH_INSTRUCTIONS = {
+_LANGUAGE_DEPTH_INSTRUCTIONS = types.MappingProxyType({
     1: "Use very simple, everyday language. Short sentences. No jargon whatsoever.",
     2: "Use clear, accessible language suitable for a general audience. Moderate vocabulary.",
     3: "Use standard professional language with appropriate field-specific terminology.",
     4: "Use sophisticated vocabulary and nuanced phrasing suitable for subject-matter specialists.",
     5: "Use advanced, expert-level vocabulary with precise technical terminology and complex analytical language.",
-}
+})
 
 _MAX_COLORS = 6
 _MAX_COMMENTS = 4
@@ -222,7 +223,10 @@ def _find_outer_json(text):
     while i < len(text):
         c = text[i]
         if c == "\\" and in_string:
-            i += 2  # skip the escaped character
+            if i + 1 < len(text):
+                i += 2  # skip the escaped character
+            else:
+                break
             continue
         if c == '"':
             in_string = not in_string
