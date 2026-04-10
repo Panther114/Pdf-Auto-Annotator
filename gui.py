@@ -62,8 +62,11 @@ LOG_TAG_COLORS = {
 # values in DEFAULT_CONFIG["annotation_colors"].
 SWATCH_TK_COLORS = ["#ffff00", "#99ff99", "#99ccff", "#ffcc99", "#ff99cc", "#ccccff"]
 
-WINDOW_MIN_WIDTH  = 720
-WINDOW_MIN_HEIGHT = 700
+WINDOW_MIN_WIDTH  = 640
+WINDOW_MIN_HEIGHT = 520
+
+# Persistent error log written next to the running script.
+LOG_FILE = Path(__file__).parent / "log.txt"
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +97,7 @@ class AnnotatorApp(tk.Tk):
         self._log_records = []        # structured dicts for JSON log
         self._discovered_categories = None
         self._output_path = None      # computed after input selected
+        self._pdf_page_count = 0      # cached page count of the loaded PDF
 
         self._build_ui()
         self._poll_queue()
@@ -103,10 +107,10 @@ class AnnotatorApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        outer_pad = {"padx": 10, "pady": 4}
+        outer_pad = {"padx": 8, "pady": 2}
 
         # -- Files -------------------------------------------------------
-        file_frame = ttk.LabelFrame(self, text="Files", padding=8)
+        file_frame = ttk.LabelFrame(self, text="Files", padding=6)
         file_frame.pack(fill="x", **outer_pad)
         file_frame.columnconfigure(1, weight=1)
 
@@ -126,12 +130,8 @@ class AnnotatorApp(tk.Tk):
             foreground="grey", anchor="w",
         ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=6)
 
-        # PDF thumbnail
-        self._thumb_label = ttk.Label(file_frame, text="No PDF loaded", foreground="grey")
-        self._thumb_label.grid(row=2, column=0, columnspan=3, pady=(4, 0))
-
         # -- Settings ----------------------------------------------------
-        settings_frame = ttk.LabelFrame(self, text="Settings", padding=8)
+        settings_frame = ttk.LabelFrame(self, text="Settings", padding=6)
         settings_frame.pack(fill="x", **outer_pad)
         settings_frame.columnconfigure(1, weight=1)
 
@@ -140,33 +140,23 @@ class AnnotatorApp(tk.Tk):
         ttk.Label(settings_frame, text="Annotation goal:").grid(
             row=row, column=0, sticky="w", pady=2)
         self._goal_var = tk.StringVar(value=DEFAULT_CONFIG.get("annotation_goal", ""))
-        goal_entry = ttk.Entry(settings_frame, textvariable=self._goal_var)
-        goal_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
-        ttk.Label(
-            settings_frame,
-            text='e.g. "study for a law school exam"',
-            foreground="grey",
-        ).grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=6)
-        row += 2
+        ttk.Entry(settings_frame, textvariable=self._goal_var).grid(
+            row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        row += 1
 
         ttk.Label(settings_frame, text="Document type:").grid(
             row=row, column=0, sticky="w", pady=2)
         self._doctype_var = tk.StringVar(value=DEFAULT_CONFIG.get("document_type", ""))
         ttk.Entry(settings_frame, textvariable=self._doctype_var).grid(
             row=row, column=1, columnspan=2, sticky="ew", padx=6)
-        ttk.Label(
-            settings_frame,
-            text='e.g. "scientific paper", "legal brief", "novel"',
-            foreground="grey",
-        ).grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=6)
-        row += 2
+        row += 1
 
         # Page range
         ttk.Label(settings_frame, text="Page range:").grid(
             row=row, column=0, sticky="w", pady=2)
         page_range_frame = ttk.Frame(settings_frame)
         page_range_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
-        ttk.Label(page_range_frame, text="From page").pack(side="left")
+        ttk.Label(page_range_frame, text="From").pack(side="left")
         self._page_from = tk.IntVar(value=1)
         ttk.Spinbox(
             page_range_frame, from_=1, to=9999, width=6,
@@ -178,19 +168,14 @@ class AnnotatorApp(tk.Tk):
             page_range_frame, from_=0, to=9999, width=6,
             textvariable=self._page_to,
         ).pack(side="left", padx=(4, 0))
-        ttk.Label(page_range_frame, text="  (0 = all pages)", foreground="grey").pack(side="left")
+        ttk.Label(page_range_frame, text="  (0 = all)", foreground="grey").pack(side="left")
         row += 1
 
-        ttk.Label(settings_frame, text="Custom notes\n(optional):").grid(
+        ttk.Label(settings_frame, text="Custom notes:").grid(
             row=row, column=0, sticky="nw", pady=2)
-        self._prompt_text = tk.Text(settings_frame, height=3, wrap="word")
+        self._prompt_text = tk.Text(settings_frame, height=2, wrap="word")
         self._prompt_text.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=2)
-        ttk.Label(
-            settings_frame,
-            text="Extra guidance appended to the auto-generated prompt.",
-            foreground="grey",
-        ).grid(row=row + 1, column=1, columnspan=2, sticky="w", padx=6)
-        row += 2
+        row += 1
 
         ttk.Label(settings_frame, text="API Key:").grid(
             row=row, column=0, sticky="w", pady=2)
@@ -207,7 +192,7 @@ class AnnotatorApp(tk.Tk):
         ).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
         row += 1
 
-        ttk.Label(settings_frame, text="Config file:").grid(
+        ttk.Label(settings_frame, text="Config file\n(optional):").grid(
             row=row, column=0, sticky="w", pady=2)
         self._config_var = tk.StringVar()
         ttk.Entry(settings_frame, textvariable=self._config_var).grid(
@@ -217,7 +202,7 @@ class AnnotatorApp(tk.Tk):
 
         # -- Phase 1 button ----------------------------------------------
         btn_frame = ttk.Frame(self)
-        btn_frame.pack(pady=(10, 2))
+        btn_frame.pack(pady=(6, 2))
 
         self._discover_btn = ttk.Button(
             btn_frame, text="Step 1: Discover Categories",
@@ -232,7 +217,7 @@ class AnnotatorApp(tk.Tk):
         self._cancel_btn.grid(row=0, column=1, padx=6)
 
         # -- Category preview panel --------------------------------------
-        cat_frame = ttk.LabelFrame(self, text="Discovered Categories (Phase 1 result)", padding=8)
+        cat_frame = ttk.LabelFrame(self, text="Discovered Categories (Phase 1 result)", padding=6)
         cat_frame.pack(fill="x", **outer_pad)
         self._cat_inner = ttk.Frame(cat_frame)
         self._cat_inner.pack(fill="x")
@@ -244,7 +229,7 @@ class AnnotatorApp(tk.Tk):
         self._cat_placeholder.pack(anchor="w")
 
         rerun_frame = ttk.Frame(cat_frame)
-        rerun_frame.pack(fill="x", pady=(4, 0))
+        rerun_frame.pack(fill="x", pady=(2, 0))
         self._rerun_btn = ttk.Button(
             rerun_frame, text="Re-run Discovery",
             command=self._start_discovery, state="disabled",
@@ -256,10 +241,10 @@ class AnnotatorApp(tk.Tk):
             self, text="Step 2: Confirm & Annotate",
             command=self._start_annotation, state="disabled",
         )
-        self._annotate_btn.pack(pady=(4, 2))
+        self._annotate_btn.pack(pady=(2, 2))
 
         # -- Progress ----------------------------------------------------
-        progress_frame = ttk.LabelFrame(self, text="Progress", padding=8)
+        progress_frame = ttk.LabelFrame(self, text="Progress", padding=6)
         progress_frame.pack(fill="x", **outer_pad)
         progress_frame.columnconfigure(0, weight=1)
 
@@ -272,17 +257,17 @@ class AnnotatorApp(tk.Tk):
 
         self._progress_bar = ttk.Progressbar(
             progress_frame, mode="determinate", maximum=100)
-        self._progress_bar.grid(row=1, column=0, sticky="ew", pady=4)
+        self._progress_bar.grid(row=1, column=0, sticky="ew", pady=2)
 
         # -- Session log -------------------------------------------------
-        log_frame = ttk.LabelFrame(self, text="Session Log", padding=8)
+        log_frame = ttk.LabelFrame(self, text="Session Log", padding=6)
         log_frame.pack(fill="both", expand=True, **outer_pad)
 
         self._log_box = scrolledtext.ScrolledText(
             log_frame,
             state="disabled",
             wrap="word",
-            height=10,
+            height=8,
             font=("Courier", 9),
         )
         self._log_box.pack(fill="both", expand=True)
@@ -323,8 +308,8 @@ class AnnotatorApp(tk.Tk):
         input_pdf = self._input_var.get().strip()
         if not input_pdf or not Path(input_pdf).exists():
             self._output_label_var.set("(auto - chosen after input selected)")
-            self._thumb_label.config(text="No PDF loaded", image="", foreground="grey")
             self._output_path = None
+            self._pdf_page_count = 0
             return
 
         # Compute output path
@@ -332,39 +317,14 @@ class AnnotatorApp(tk.Tk):
         self._output_path = str(out)
         self._output_label_var.set(self._output_path)
 
-        # PDF thumbnail (first page)
-        self._load_thumbnail(input_pdf)
-
-        # Set page_to spinbox max to number of pages
+        # Cache page count and update page_to spinbox in a single open
         try:
             doc = fitz.open(input_pdf)
-            n = len(doc)
+            self._pdf_page_count = len(doc)
             doc.close()
-            self._page_to.set(n)
+            self._page_to.set(self._pdf_page_count)
         except Exception:
-            pass
-
-    def _load_thumbnail(self, pdf_path):
-        """Render the first page of the PDF as a small preview label."""
-        try:
-            doc = fitz.open(pdf_path)
-            page = doc[0]
-            # Render at low resolution (fits in ~180 px wide)
-            mat = fitz.Matrix(0.25, 0.25)
-            pix = page.get_pixmap(matrix=mat)
-            doc.close()
-            # Encode as PPM and feed to Tk PhotoImage
-            img_data = pix.tobytes("ppm")
-            photo = tk.PhotoImage(data=img_data)
-            self._thumb_photo = photo  # keep reference
-            self._thumb_label.config(
-                image=photo, text="", compound="center",
-            )
-        except Exception as exc:
-            self._thumb_label.config(
-                text="Preview unavailable: {}".format(exc),
-                image="", foreground="grey",
-            )
+            self._pdf_page_count = 0
 
     # ------------------------------------------------------------------
     # Build config from UI
@@ -389,19 +349,14 @@ class AnnotatorApp(tk.Tk):
         if custom_prompt:
             config["_custom_prompt"] = custom_prompt
 
-        # Page range
+        # Page range — use cached page count to avoid re-opening the PDF
         p_from = self._page_from.get()
         p_to = self._page_to.get()
-        if p_to > 0 and (p_from > 1 or p_to < 99999):
-            try:
-                doc = fitz.open(self._input_var.get().strip())
-                total = len(doc)
-                doc.close()
-                start = max(0, p_from - 1)
-                end = min(p_to, total)
-                config["_page_range"] = range(start, end)
-            except Exception:
-                pass
+        total = self._pdf_page_count
+        if total > 0 and p_to > 0:
+            start = max(0, p_from - 1)
+            end = min(p_to, total)
+            config["_page_range"] = range(start, end)
 
         return config
 
@@ -684,6 +639,14 @@ class AnnotatorApp(tk.Tk):
         self._log_box.insert("end", line, tag)
         self._log_box.see("end")
         self._log_box.config(state="disabled")
+
+        # Persist errors and warnings to the log file immediately.
+        if level in ("ERROR", "WARNING"):
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                    fh.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S ") + line)
+            except OSError:
+                pass
 
     def _clear_log(self):
         self._log_lines = []
