@@ -42,6 +42,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Persistent error log written next to the running script (or CWD as fallback).
+_LOG_FILE = Path(__file__).parent / "log.txt"
+try:
+    _file_handler = logging.FileHandler(_LOG_FILE, encoding="utf-8")
+    _file_handler.setLevel(logging.WARNING)
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    logging.getLogger().addHandler(_file_handler)
+except OSError:
+    pass  # If the log file cannot be created, continue without it
+
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
@@ -543,7 +555,8 @@ def annotate_pdf(
     page_range = config.get("_page_range", range(total))
     page_results = []
 
-    for page_num in page_range:
+    page_list = list(page_range)
+    for idx, page_num in enumerate(page_list):
         if _cancelled():
             _log("INFO", "Annotation cancelled by user.")
             break
@@ -568,6 +581,7 @@ def annotate_pdf(
 
         page_start = time.monotonic()
         success = False
+        is_last_page = (idx == len(page_list) - 1)
 
         for attempt in range(config["max_retries"]):
             if _cancelled():
@@ -595,7 +609,9 @@ def annotate_pdf(
                 _log("INFO", "  Annotated successfully.")
                 elapsed = round(time.monotonic() - page_start, 2)
                 page_results.append({"page": page_num + 1, "status": "ok", "elapsed_s": elapsed})
-                time.sleep(config["sleep_between_pages"])
+                # Skip the inter-page sleep on the last page to avoid unnecessary delay.
+                if not is_last_page:
+                    time.sleep(config["sleep_between_pages"])
                 success = True
                 break
 
