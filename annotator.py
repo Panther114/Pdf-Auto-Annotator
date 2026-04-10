@@ -65,8 +65,9 @@ DEFAULT_CONFIG: dict = {
     "sleep_between_pages": 3,
     "min_text_length": 200,
     # Number of pages sampled during Phase 1 category discovery.
-    # 0 = all pages (default). Values larger than the document page count also sample all pages.
-    "discovery_sample_pages": 0,
+    # 0 = all pages. Values larger than the document page count also sample all pages.
+    # Defaulting to 3 to keep the prompt short and avoid "Bad request" errors from the API.
+    "discovery_sample_pages": 3,
     # What you want to get out of the annotation.
     "annotation_goal": "",
     # Optional hint about the document type - helps the LLM choose better categories.
@@ -271,16 +272,29 @@ def discover_categories(doc, config, client, log_cb=None):
 
     sample_text = "\n\n[next page]\n\n".join(parts)
     prompt = build_discovery_prompt(sample_text, config)
-    _log("INFO", "Discovering annotation categories from {} sample page(s)...".format(len(parts)))
+    _log(
+        "INFO",
+        "Discovering annotation categories from {} sample page(s) "
+        "({} chars, prompt ~{} chars)...".format(
+            len(parts), len(sample_text), len(prompt)
+        ),
+    )
 
     for attempt in range(config["max_retries"]):
         try:
+            _log(
+                "INFO",
+                "Discovery attempt {}/{} - sending request to model '{}'...".format(
+                    attempt + 1, config["max_retries"], config["model"]
+                ),
+            )
             response = client.chat_completion(
                 model=config["model"],
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=400,
             )
             raw = response.choices[0].message.content
+            _log("INFO", "Discovery raw response ({} chars): {}".format(len(raw), raw[:300]))
             parsed = extract_and_parse_json(raw)
 
             if isinstance(parsed, list) and len(parsed) == num_features:
@@ -296,12 +310,39 @@ def discover_categories(doc, config, client, log_cb=None):
                 )
                 return categories
 
-            _log("WARNING", "Attempt {}: unexpected response shape - retrying...".format(attempt + 1))
+            _log(
+                "WARNING",
+                "Attempt {}: unexpected response shape "
+                "(expected list of {}, got {} - {}). Retrying...".format(
+                    attempt + 1, num_features,
+                    type(parsed).__name__,
+                    repr(parsed)[:200],
+                ),
+            )
 
         except Exception as exc:
-            _log("WARNING", "Discovery attempt {} failed: {}".format(attempt + 1, exc))
+            exc_type = type(exc).__name__
+            exc_msg = str(exc)
+            _log(
+                "WARNING",
+                "Discovery attempt {} failed [{}]: {}".format(attempt + 1, exc_type, exc_msg),
+            )
+            # Extra hint for common failure modes
+            if "400" in exc_msg or "bad request" in exc_msg.lower():
+                _log(
+                    "WARNING",
+                    "  Hint: 'Bad request' often means the prompt is too long "
+                    "or the model does not accept this input. "
+                    "Try reducing 'discovery_sample_pages' or switching model.",
+                )
+            elif "401" in exc_msg or "unauthorized" in exc_msg.lower():
+                _log("WARNING", "  Hint: API key may be invalid or expired.")
+            elif "429" in exc_msg or "rate limit" in exc_msg.lower():
+                _log("WARNING", "  Hint: Rate limited - will wait before retrying.")
             if attempt < config["max_retries"] - 1:
-                time.sleep(2 * (attempt + 1))
+                wait = 2 * (attempt + 1)
+                _log("INFO", "  Waiting {}s before next attempt...".format(wait))
+                time.sleep(wait)
 
     _log("WARNING", "Discovery failed - falling back to generic categories.")
     return _fallback_categories(num_features)
@@ -569,15 +610,16 @@ def annotate_pdf(
     page_results = []
 
     page_list = list(page_range)
+    pages_to_annotate = len(page_list)
     for idx, page_num in enumerate(page_list):
         if _cancelled():
             _log("INFO", "Annotation cancelled by user.")
             break
 
         if progress_cb:
-            progress_cb(page_num + 1, total)
+            progress_cb(idx + 1, pages_to_annotate)
 
-        _log("INFO", "Page {}/{} ...".format(page_num + 1, total))
+        _log("INFO", "Page {}/{} (PDF page {}) ...".format(idx + 1, pages_to_annotate, page_num + 1))
         page = doc[page_num]
         text = page.get_text()
 
@@ -659,7 +701,7 @@ def annotate_pdf(
 
     doc.save(output_pdf)
     if progress_cb:
-        progress_cb(total, total)
+        progress_cb(pages_to_annotate, pages_to_annotate)
     _log("INFO", "Done! Saved annotated PDF as: {}".format(output_pdf))
 
     return page_results

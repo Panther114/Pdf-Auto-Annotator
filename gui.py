@@ -117,55 +117,55 @@ class AnnotatorApp(tk.Tk):
     # ------------------------------------------------------------------
 
     def _build_ui(self):
-        outer_pad = {"padx": 8, "pady": 2}
+        outer_pad = {"padx": 6, "pady": 1}
 
         # -- Files -------------------------------------------------------
-        file_frame = ttk.LabelFrame(self, text="Files", padding=6)
+        file_frame = ttk.LabelFrame(self, text="Files", padding=4)
         file_frame.pack(fill="x", **outer_pad)
         file_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(file_frame, text="Input PDF:").grid(row=0, column=0, sticky="w", pady=2)
+        ttk.Label(file_frame, text="Input PDF:").grid(row=0, column=0, sticky="w", pady=1)
         self._input_var = tk.StringVar()
         self._input_var.trace_add("write", self._on_input_changed)
         ttk.Entry(file_frame, textvariable=self._input_var).grid(
-            row=0, column=1, sticky="ew", padx=6)
+            row=0, column=1, sticky="ew", padx=4)
         ttk.Button(file_frame, text="Browse...",
                    command=self._browse_input).grid(row=0, column=2)
 
         # Output path label (read-only, auto-computed)
-        ttk.Label(file_frame, text="Output PDF:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(file_frame, text="Output PDF:").grid(row=1, column=0, sticky="w", pady=1)
         self._output_label_var = tk.StringVar(value="(auto - chosen after input selected)")
         ttk.Label(
             file_frame, textvariable=self._output_label_var,
             foreground="grey", anchor="w",
-        ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=6)
+        ).grid(row=1, column=1, columnspan=2, sticky="ew", padx=4)
 
         # -- Settings ----------------------------------------------------
-        settings_frame = ttk.LabelFrame(self, text="Settings", padding=6)
+        settings_frame = ttk.LabelFrame(self, text="Settings", padding=4)
         settings_frame.pack(fill="x", **outer_pad)
         settings_frame.columnconfigure(1, weight=1)
 
         row = 0
 
         ttk.Label(settings_frame, text="Annotation goal:").grid(
-            row=row, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=1)
         self._goal_var = tk.StringVar(value=DEFAULT_CONFIG.get("annotation_goal", ""))
         ttk.Entry(settings_frame, textvariable=self._goal_var).grid(
-            row=row, column=1, columnspan=2, sticky="ew", padx=6)
+            row=row, column=1, columnspan=2, sticky="ew", padx=4)
         row += 1
 
         ttk.Label(settings_frame, text="Document type:").grid(
-            row=row, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=1)
         self._doctype_var = tk.StringVar(value=DEFAULT_CONFIG.get("document_type", ""))
         ttk.Entry(settings_frame, textvariable=self._doctype_var).grid(
-            row=row, column=1, columnspan=2, sticky="ew", padx=6)
+            row=row, column=1, columnspan=2, sticky="ew", padx=4)
         row += 1
 
         # Page range
         ttk.Label(settings_frame, text="Page range:").grid(
-            row=row, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=1)
         page_range_frame = ttk.Frame(settings_frame)
-        page_range_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=6)
+        page_range_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=4)
         ttk.Label(page_range_frame, text="From").pack(side="left")
         self._page_from = tk.IntVar(value=1)
         ttk.Spinbox(
@@ -182,37 +182,37 @@ class AnnotatorApp(tk.Tk):
         row += 1
 
         ttk.Label(settings_frame, text="Custom notes:").grid(
-            row=row, column=0, sticky="nw", pady=2)
+            row=row, column=0, sticky="nw", pady=1)
         self._prompt_text = tk.Text(settings_frame, height=2, wrap="word")
-        self._prompt_text.grid(row=row, column=1, columnspan=2, sticky="ew", padx=6, pady=2)
+        self._prompt_text.grid(row=row, column=1, columnspan=2, sticky="ew", padx=4, pady=1)
         row += 1
 
         ttk.Label(settings_frame, text="API Key:").grid(
-            row=row, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=1)
         self._apikey_var = tk.StringVar(value=DEFAULT_CONFIG["api_key"])
         ttk.Entry(settings_frame, textvariable=self._apikey_var, show="*").grid(
-            row=row, column=1, columnspan=2, sticky="ew", padx=6)
+            row=row, column=1, columnspan=2, sticky="ew", padx=4)
         row += 1
 
         ttk.Label(settings_frame, text="Model:").grid(
-            row=row, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=1)
         self._model_var = tk.StringVar(value=DEFAULT_CONFIG["model"])
         ttk.Combobox(
             settings_frame, textvariable=self._model_var, values=PRESET_MODELS,
-        ).grid(row=row, column=1, columnspan=2, sticky="ew", padx=6)
+        ).grid(row=row, column=1, columnspan=2, sticky="ew", padx=4)
         row += 1
 
         ttk.Label(settings_frame, text="Config file\n(optional):").grid(
-            row=row, column=0, sticky="w", pady=2)
+            row=row, column=0, sticky="w", pady=1)
         self._config_var = tk.StringVar()
         ttk.Entry(settings_frame, textvariable=self._config_var).grid(
-            row=row, column=1, sticky="ew", padx=6)
+            row=row, column=1, sticky="ew", padx=4)
         ttk.Button(settings_frame, text="Browse...",
                    command=self._browse_config).grid(row=row, column=2)
 
         # -- Phase 1 button ----------------------------------------------
         btn_frame = ttk.Frame(self)
-        btn_frame.pack(pady=(6, 2))
+        btn_frame.pack(pady=(4, 1))
 
         self._discover_btn = ttk.Button(
             btn_frame, text="Step 1: Discover Categories",
@@ -227,7 +227,7 @@ class AnnotatorApp(tk.Tk):
         self._cancel_btn.grid(row=0, column=1, padx=6)
 
         # -- Category preview panel --------------------------------------
-        cat_frame = ttk.LabelFrame(self, text="Discovered Categories (Phase 1 result)", padding=6)
+        cat_frame = ttk.LabelFrame(self, text="Discovered Categories (Phase 1 result)", padding=4)
         cat_frame.pack(fill="x", **outer_pad)
         self._cat_inner = ttk.Frame(cat_frame)
         self._cat_inner.pack(fill="x")
@@ -239,7 +239,7 @@ class AnnotatorApp(tk.Tk):
         self._cat_placeholder.pack(anchor="w")
 
         rerun_frame = ttk.Frame(cat_frame)
-        rerun_frame.pack(fill="x", pady=(2, 0))
+        rerun_frame.pack(fill="x", pady=(1, 0))
         self._rerun_btn = ttk.Button(
             rerun_frame, text="Re-run Discovery",
             command=self._start_discovery, state="disabled",
@@ -251,10 +251,10 @@ class AnnotatorApp(tk.Tk):
             self, text="Step 2: Confirm & Annotate",
             command=self._start_annotation, state="disabled",
         )
-        self._annotate_btn.pack(pady=(2, 2))
+        self._annotate_btn.pack(pady=(1, 1))
 
         # -- Progress ----------------------------------------------------
-        progress_frame = ttk.LabelFrame(self, text="Progress", padding=6)
+        progress_frame = ttk.LabelFrame(self, text="Progress", padding=4)
         progress_frame.pack(fill="x", **outer_pad)
         progress_frame.columnconfigure(0, weight=1)
 
@@ -267,10 +267,10 @@ class AnnotatorApp(tk.Tk):
 
         self._progress_bar = ttk.Progressbar(
             progress_frame, mode="determinate", maximum=100)
-        self._progress_bar.grid(row=1, column=0, sticky="ew", pady=2)
+        self._progress_bar.grid(row=1, column=0, sticky="ew", pady=1)
 
         # -- Session log -------------------------------------------------
-        log_frame = ttk.LabelFrame(self, text="Session Log", padding=6)
+        log_frame = ttk.LabelFrame(self, text="Session Log", padding=4)
         log_frame.pack(fill="both", expand=True, **outer_pad)
 
         self._log_box = scrolledtext.ScrolledText(
