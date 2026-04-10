@@ -60,10 +60,13 @@ except OSError:
 DEFAULT_CONFIG: dict = {
     "api_key": "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",
     "model": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "max_tokens": 1000,
+    "max_tokens": 4000,
     "max_retries": 3,
     "sleep_between_pages": 3,
     "min_text_length": 200,
+    # Number of pages sampled during Phase 1 category discovery.
+    # 0 = all pages (default). Values larger than the document page count also sample all pages.
+    "discovery_sample_pages": 0,
     # What you want to get out of the annotation.
     "annotation_goal": "",
     # Optional hint about the document type - helps the LLM choose better categories.
@@ -87,9 +90,9 @@ DEFAULT_CONFIG: dict = {
 _MAX_COLORS = 6
 _MAX_COMMENTS = 4
 
-# Phase 1 sampling parameters
-_DISCOVERY_SAMPLE_PAGES = 3
-_DISCOVERY_CHARS_PER_PAGE = 2000
+# Phase 1 sampling parameters (overridable via config; 0 = all pages)
+_DISCOVERY_SAMPLE_PAGES = 0
+_DISCOVERY_CHARS_PER_PAGE = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +252,15 @@ def discover_categories(doc, config, client, log_cb=None):
 
     num_features = len(config["annotation_colors"])
 
+    sample_limit = config.get("discovery_sample_pages", _DISCOVERY_SAMPLE_PAGES)
+    page_count = len(doc)
+    if sample_limit == 0 or sample_limit >= page_count:
+        pages_to_sample = page_count
+    else:
+        pages_to_sample = sample_limit
+
     parts = []
-    for page_num in range(min(_DISCOVERY_SAMPLE_PAGES, len(doc))):
+    for page_num in range(pages_to_sample):
         text = doc[page_num].get_text().strip()
         if text:
             parts.append(text[:_DISCOVERY_CHARS_PER_PAGE])

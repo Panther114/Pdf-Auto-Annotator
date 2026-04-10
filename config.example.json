@@ -18,8 +18,11 @@
 
   "append_legend": true,
 
-  "max_tokens": 1000,
+  "max_tokens": 4000,
   "max_retries": 3,
   "sleep_between_pages": 3,
-  "min_text_length": 200
+  "min_text_length": 200,
+
+  "_comment_discovery": "discovery_sample_pages: how many pages to sample for Phase 1 category discovery. 0 = all pages (default).",
+  "discovery_sample_pages": 0
 }
