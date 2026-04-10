@@ -27,6 +27,7 @@ import re
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -72,6 +73,8 @@ DEFAULT_CONFIG: dict = {
     "annotation_goal": "",
     # Optional hint about the document type - helps the LLM choose better categories.
     "document_type": "",
+    # Vocabulary sophistication of annotations: 1 (simplest) to 5 (most advanced).
+    "language_depth": 2,
     # Highlight colours (RGB, each value 0-1).
     # Phase 1 assigns discovered features to these colours in order.
     # Add, remove, or change colours here; the count also controls how many
@@ -87,6 +90,15 @@ DEFAULT_CONFIG: dict = {
     # Append a human-readable legend page at the end of the annotated PDF.
     "append_legend": True,
 }
+
+# Language depth instructions injected into prompts (1 = simplest, 5 = most advanced).
+_LANGUAGE_DEPTH_INSTRUCTIONS = types.MappingProxyType({
+    1: "Use very simple, everyday language. Short sentences. No jargon whatsoever.",
+    2: "Use clear, accessible language suitable for a general audience. Moderate vocabulary.",
+    3: "Use standard professional language with appropriate field-specific terminology.",
+    4: "Use sophisticated vocabulary and nuanced phrasing suitable for subject-matter specialists.",
+    5: "Use advanced, expert-level vocabulary with precise technical terminology and complex analytical language.",
+})
 
 _MAX_COLORS = 6
 _MAX_COMMENTS = 4
@@ -170,28 +182,146 @@ def validate_config(config):
         if val is not None and (not isinstance(val, (int, float)) or float(val) < 0):
             raise ValueError("'{}' must be a non-negative number. Got: {}".format(field, val))
 
+    depth = config.get("language_depth", 2)
+    if not isinstance(depth, int) or depth < 1 or depth > 5:
+        raise ValueError("'language_depth' must be an integer from 1 to 5. Got: {}".format(depth))
+
 
 # ---------------------------------------------------------------------------
 # JSON parsing
 # ---------------------------------------------------------------------------
 
+def _find_outer_json(text):
+    """Return the first outermost JSON object or array in *text*.
+
+    Uses bracket-counting so it correctly handles nested structures.
+    String content (including escaped characters) is skipped so that
+    braces/brackets inside strings are not counted.
+    """
+    # Strip markdown code fences before searching.
+    text = re.sub(r"```(?:json)?\s*", "", text).strip()
+
+    first_brace = text.find("{")
+    first_bracket = text.find("[")
+
+    if first_brace == -1 and first_bracket == -1:
+        return None
+
+    if first_brace == -1:
+        start_idx = first_bracket
+    elif first_bracket == -1:
+        start_idx = first_brace
+    else:
+        start_idx = min(first_brace, first_bracket)
+
+    open_char = text[start_idx]
+    close_char = "}" if open_char == "{" else "]"
+
+    depth = 0
+    in_string = False
+    i = start_idx
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and in_string:
+            if i + 1 < len(text):
+                i += 2  # skip the escaped character
+            else:
+                break
+            continue
+        if c == '"':
+            in_string = not in_string
+        elif not in_string:
+            if c == open_char:
+                depth += 1
+            elif c == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx : i + 1]
+        i += 1
+
+    return None
+
+
+def _repair_json(raw):
+    """Apply heuristic repairs to fix common JSON formatting issues from LLMs.
+
+    Fixes applied (in order):
+    1. Strip markdown fences.
+    2. Remove trailing commas before ``}`` or ``]``.
+    3. Insert missing commas between adjacent string/value tokens.
+    """
+    # 1. Strip markdown fences.
+    raw = re.sub(r"```(?:json)?\s*", "", raw).strip()
+
+    # 2. Remove trailing commas before } or ]
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+
+    # 3. Insert missing commas between adjacent values that sit on consecutive
+    #    lines without a comma.  Pattern: end of a value token followed
+    #    immediately (with only whitespace) by the start of a new value token.
+    #    Value-end tokens: ", ], }, digits, true, false, null.
+    #    Value-start tokens: ", [, {.
+    raw = re.sub(
+        r'("(?:[^"\\]|\\.)*"|\d[\d.eE+\-]*|true|false|null|\]|\})'
+        r'(\s+)'
+        r'("|\[|\{)',
+        lambda m: m.group(1) + "," + m.group(2) + m.group(3),
+        raw,
+    )
+
+    return raw
+
+
 def extract_and_parse_json(text):
-    match = re.search(r"(\{.*?\}|\[.*?\])", text, re.DOTALL)
-    if not match:
-        raise ValueError("No JSON object or array found in model response.")
-    
-    raw = match.group(0)
-    
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-    
-    cleaned = re.sub(r"```(?:json)?", "", raw).strip()
+    """Extract and parse the first JSON object or array from *text*.
+
+    Tries multiple strategies in order:
+    1. Direct ``json.loads`` of the full (cleaned) text.
+    2. Bracket-counted extraction of the outermost JSON block.
+    3. Heuristic repairs (trailing commas, missing commas).
+    4. ``ast.literal_eval`` for Python-style dict/list literals.
+
+    Raises ``ValueError`` if all strategies fail.
+    """
+    # Clean markdown fences.
+    cleaned = re.sub(r"```(?:json)?\s*", "", text).strip()
+
+    # Strategy 1: parse cleaned text directly.
     try:
         return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: bracket-counted extraction.
+    raw = _find_outer_json(cleaned)
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 3: heuristic repairs on the extracted block.
+        repaired = _repair_json(raw)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 4: ast.literal_eval handles Python-style dicts/lists
+        # (single quotes, trailing commas, etc.).
+        try:
+            result = ast.literal_eval(repaired)
+            if isinstance(result, (dict, list)):
+                return result
+        except (ValueError, SyntaxError):
+            pass
+
+    # All strategies exhausted — raise with the original error message.
+    try:
+        json.loads(raw or cleaned)
     except json.JSONDecodeError as exc:
         raise ValueError("Failed to parse model output as JSON: {}".format(exc)) from exc
+    raise ValueError("No JSON object or array found in model response.")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +333,8 @@ def build_discovery_prompt(sample_text, config):
     num_features = len(config["annotation_colors"])
     goal = (config.get("annotation_goal") or "").strip() or "identify the most important ideas"
     doc_type = (config.get("document_type") or "").strip() or "general document"
+    depth = int(config.get("language_depth", 2))
+    lang_instruction = _LANGUAGE_DEPTH_INSTRUCTIONS.get(depth, _LANGUAGE_DEPTH_INSTRUCTIONS[2])
 
     example_items = "\n".join(
         '    {{"key": "feature_{i}", "label": "One-sentence description of what to highlight"}}'.format(i=i)
@@ -212,7 +344,8 @@ def build_discovery_prompt(sample_text, config):
     return (
         "You are an expert document analyst preparing to annotate a PDF.\n\n"
         "Document type: {doc_type}\n"
-        "Annotation goal: {goal}\n\n"
+        "Annotation goal: {goal}\n"
+        "Language style for labels: {lang_instruction}\n\n"
         "Below is a representative sample of the document text:\n"
         "---\n"
         "{sample_text}\n"
@@ -223,7 +356,8 @@ def build_discovery_prompt(sample_text, config):
         "- Each feature must be clearly different from the others (no overlap).\n"
         "- Use plain language that a first-time reader can understand.\n"
         "- The 'key' must be a short snake_case identifier (letters, digits, underscores only).\n"
-        "- The 'label' is one sentence describing what kind of text to highlight.\n\n"
+        "- The 'label' is one sentence describing what kind of text to highlight.\n"
+        "- Write labels at the language style indicated above.\n\n"
         "Respond ONLY with a valid JSON array of exactly {n} objects, like this:\n"
         "[\n"
         "{example_items}\n"
@@ -231,6 +365,7 @@ def build_discovery_prompt(sample_text, config):
     ).format(
         doc_type=doc_type,
         goal=goal,
+        lang_instruction=lang_instruction,
         sample_text=sample_text,
         n=num_features,
         example_items=example_items,
@@ -370,6 +505,8 @@ def build_prompt(text, config, categories):
     num_comments = config["num_comments"]
     goal = (config.get("annotation_goal") or "").strip() or "identify the most important ideas"
     doc_type = (config.get("document_type") or "").strip() or "document"
+    depth = int(config.get("language_depth", 2))
+    lang_instruction = _LANGUAGE_DEPTH_INSTRUCTIONS.get(depth, _LANGUAGE_DEPTH_INSTRUCTIONS[2])
 
     categories_desc = "\n".join(
         "  - {key}: sentences related to {label}".format(**cat)
@@ -386,7 +523,8 @@ def build_prompt(text, config, categories):
 
     prompt = (
         "You are an expert analyst annotating a page from a {doc_type}.\n"
-        "Annotation goal: {goal}\n\n"
+        "Annotation goal: {goal}\n"
+        "Language style: {lang_instruction}\n\n"
         "Task 1 - Highlights:\n"
         "Extract {nh_min} to {nh_max} important sentences from the text below.\n"
         "Categorize each sentence into one of these JSON arrays:\n"
@@ -398,9 +536,11 @@ def build_prompt(text, config, categories):
         "Write {nc} short, note-style comment(s) about this page.\n"
         "- Maximum 10-15 words each; incomplete sentences are fine.\n"
         "- Make each comment specific to this page's content.\n"
+        "- Write comments at the language style indicated above.\n"
     ).format(
         doc_type=doc_type,
         goal=goal,
+        lang_instruction=lang_instruction,
         nh_min=num_highlights["min"],
         nh_max=num_highlights["max"],
         categories_desc=categories_desc,
@@ -739,6 +879,14 @@ def build_arg_parser():
         help='Type of document, e.g. "scientific paper", "legal brief", "novel"',
     )
     parser.add_argument(
+        "--language-depth", dest="language_depth", type=int, choices=range(1, 6),
+        metavar="LEVEL",
+        help=(
+            "Vocabulary sophistication of annotations: 1 (simplest) to 5 (most advanced). "
+            "Default: 2"
+        ),
+    )
+    parser.add_argument(
         "--pages", metavar="START-END",
         help='Annotate only a page range, e.g. "1-10" (1-indexed, inclusive)',
     )
@@ -783,6 +931,8 @@ def main():
         config["annotation_goal"] = args.annotation_goal
     if args.document_type:
         config["document_type"] = args.document_type
+    if args.language_depth is not None:
+        config["language_depth"] = args.language_depth
 
     try:
         validate_config(config)
