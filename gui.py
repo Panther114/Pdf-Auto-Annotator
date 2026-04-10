@@ -353,7 +353,7 @@ class AnnotatorApp(tk.Tk):
         p_from = self._page_from.get()
         p_to = self._page_to.get()
         total = self._pdf_page_count
-        if total > 0 and p_to > 0 and (p_from > 1 or p_to < total):
+        if total > 0 and p_to > 0:
             start = max(0, p_from - 1)
             end = min(p_to, total)
             config["_page_range"] = range(start, end)
@@ -644,7 +644,7 @@ class AnnotatorApp(tk.Tk):
         if level in ("ERROR", "WARNING"):
             try:
                 with open(LOG_FILE, "a", encoding="utf-8") as fh:
-                    fh.write(datetime.now().strftime("%Y-%m-%d ") + line)
+                    fh.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S ") + line)
             except OSError:
                 pass
 
