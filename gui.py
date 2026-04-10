@@ -30,6 +30,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 from annotator import (
     DEFAULT_CONFIG,
+    _LANGUAGE_DEPTH_INSTRUCTIONS,
     annotate_pdf,
     compute_output_path,
     discover_categories,
@@ -202,6 +203,24 @@ class AnnotatorApp(tk.Tk):
         ).grid(row=row, column=1, columnspan=2, sticky="ew", padx=4)
         row += 1
 
+        # Language depth slider
+        ttk.Label(settings_frame, text="Language depth:").grid(
+            row=row, column=0, sticky="w", pady=1)
+        lang_depth_frame = ttk.Frame(settings_frame)
+        lang_depth_frame.grid(row=row, column=1, columnspan=2, sticky="ew", padx=4)
+        self._lang_depth_var = tk.IntVar(value=DEFAULT_CONFIG.get("language_depth", 2))
+        lang_scale = ttk.Scale(
+            lang_depth_frame, from_=1, to=5, orient="horizontal",
+            variable=self._lang_depth_var,
+            command=lambda v: self._lang_depth_var.set(round(float(v))),
+        )
+        lang_scale.pack(side="left", fill="x", expand=True)
+        self._lang_depth_label = ttk.Label(lang_depth_frame, width=36, foreground="grey")
+        self._lang_depth_label.pack(side="left", padx=(8, 0))
+        self._lang_depth_var.trace_add("write", self._on_lang_depth_changed)
+        self._on_lang_depth_changed()  # initialise label
+        row += 1
+
         ttk.Label(settings_frame, text="Config file\n(optional):").grid(
             row=row, column=0, sticky="w", pady=1)
         self._config_var = tk.StringVar()
@@ -309,6 +328,55 @@ class AnnotatorApp(tk.Tk):
         )
         if path:
             self._config_var.set(path)
+            self._apply_config_file(path)
+
+    def _apply_config_file(self, path):
+        """Load a JSON config file and auto-fill matching settings fields."""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception as exc:
+            messagebox.showwarning(
+                "Config load warning",
+                "Could not read config file:\n{}\n\n{}".format(path, exc),
+            )
+            return
+
+        if "api_key" in cfg and cfg["api_key"]:
+            self._apikey_var.set(cfg["api_key"])
+        if "model" in cfg and cfg["model"]:
+            self._model_var.set(cfg["model"])
+        if "annotation_goal" in cfg:
+            self._goal_var.set(cfg["annotation_goal"] or "")
+        if "document_type" in cfg:
+            self._doctype_var.set(cfg["document_type"] or "")
+        if "language_depth" in cfg:
+            try:
+                depth = int(cfg["language_depth"])
+                if 1 <= depth <= 5:
+                    self._lang_depth_var.set(depth)
+            except (TypeError, ValueError):
+                pass
+        # Custom notes / instructions stored under _custom_prompt or instructions
+        for key in ("_custom_prompt", "instructions", "custom_notes"):
+            if key in cfg and cfg[key]:
+                self._prompt_text.delete("1.0", "end")
+                self._prompt_text.insert("1.0", cfg[key])
+                break
+
+    # ------------------------------------------------------------------
+    # Language depth slider callback
+    # ------------------------------------------------------------------
+
+    def _on_lang_depth_changed(self, *_):
+        """Update the descriptive label beside the language depth slider."""
+        try:
+            depth = int(self._lang_depth_var.get())
+        except (tk.TclError, ValueError):
+            return
+        depth = max(1, min(5, depth))
+        label = _LANGUAGE_DEPTH_INSTRUCTIONS.get(depth, "")
+        self._lang_depth_label.config(text="{}  {}".format(depth, label))
 
     # ------------------------------------------------------------------
     # Input-change hook
@@ -376,6 +444,12 @@ class AnnotatorApp(tk.Tk):
         doc_type = self._doctype_var.get().strip()
         if doc_type:
             config["document_type"] = doc_type
+        try:
+            depth = int(self._lang_depth_var.get())
+            if 1 <= depth <= 5:
+                config["language_depth"] = depth
+        except (tk.TclError, ValueError):
+            pass
         custom_prompt = self._prompt_text.get("1.0", "end-1c").strip()
         if custom_prompt:
             config["_custom_prompt"] = custom_prompt

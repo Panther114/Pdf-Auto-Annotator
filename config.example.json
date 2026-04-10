@@ -7,6 +7,9 @@
   "annotation_goal": "study for a law school exam",
   "document_type": "legal brief",
 
+  "_comment_language_depth": "language_depth: vocabulary sophistication of annotations. 1 = simplest everyday language, 5 = advanced expert-level terminology.",
+  "language_depth": 2,
+
   "annotation_colors": [
     [1,   1,   0  ],
     [0.6, 1,   0.6],
